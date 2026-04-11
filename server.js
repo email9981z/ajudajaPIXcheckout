@@ -5,6 +5,14 @@ const querystring = require('querystring');
 const fs = require('fs');
 const path = require('path');
 
+// Tenta carregar o cheerio para um parsing de HTML mais robusto
+let cheerio;
+try {
+  cheerio = require('cheerio');
+} catch (e) {
+  console.warn('Aviso: Cheerio não encontrado. Usando fallback de Regex para extração do PIX.');
+}
+
 // ==================== CONFIGURAÇÕES FIXAS ====================
 const CAMPAIGN_ID = '104552'; // ID da sua campanha no ajudaja.com.br
 // =============================================================
@@ -17,6 +25,8 @@ const mimeTypes = {
   '.css': 'text/css',
   '.png': 'image/png',
   '.jpg': 'image/jpeg',
+  '.gif': 'image/gif',
+  '.svg': 'image/svg+xml',
   '.ico': 'image/x-icon',
 };
 
@@ -25,15 +35,19 @@ function makeRequest(options, postData) {
     const req = https.request(options, (res) => {
       let data = '';
       res.on('data', (chunk) => { data += chunk; });
-      res.on('end', () => resolve({ statusCode: res.statusCode, headers: res.headers, body: data }));
+      res.on('end', () => resolve({ 
+        statusCode: res.statusCode, 
+        headers: res.headers, 
+        body: data 
+      }));
     });
     req.on('error', (err) => {
-      console.error('Request Error:', err.message);
+      console.error('Erro na requisição HTTPS:', err.message);
       reject(err);
     });
     req.setTimeout(30000, () => {
       req.destroy();
-      reject(new Error('Request timeout'));
+      reject(new Error('Tempo limite da requisição (timeout) atingido'));
     });
     if (postData) req.write(postData);
     req.end();
@@ -41,6 +55,7 @@ function makeRequest(options, postData) {
 }
 
 const server = http.createServer(async (req, res) => {
+  // Configuração de CORS
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
@@ -54,14 +69,25 @@ const server = http.createServer(async (req, res) => {
   const parsedUrl = url.parse(req.url, true);
   const pathname = parsedUrl.pathname;
 
+  // Rota do Proxy PIX
   if (pathname === '/proxy/pix' && req.method === 'POST') {
     let body = '';
     req.on('data', (chunk) => { body += chunk; });
     req.on('end', async () => {
       try {
         console.log('--- Nova requisição PIX recebida ---');
-        const params = JSON.parse(body);
-        console.log('Parâmetros:', { campaign_id: CAMPAIGN_ID, payer_name: params.payer_name, amount: params.amount });
+        let params;
+        try {
+          params = JSON.parse(body);
+        } catch (e) {
+          throw new Error('JSON enviado pelo frontend é inválido');
+        }
+
+        console.log('Parâmetros:', { 
+          campaign_id: CAMPAIGN_ID, 
+          payer_name: params.payer_name, 
+          amount: params.amount 
+        });
 
         const postData = querystring.stringify({
           campaign_id: CAMPAIGN_ID,
@@ -71,7 +97,7 @@ const server = http.createServer(async (req, res) => {
           amount: params.amount,
         });
 
-        console.log('Passo 1: Enviando dados para ajudaja...');
+        console.log('Passo 1: Solicitando pagamento ao ajudaja...');
         const ajudajaResponse = await makeRequest({
           hostname: 'ajudaja.com.br',
           path: '/ajudar/ajax_payment_pix.php',
@@ -87,24 +113,31 @@ const server = http.createServer(async (req, res) => {
           },
         }, postData);
 
+        if (ajudajaResponse.statusCode !== 200) {
+          console.error('Erro na API do ajudaja. Status:', ajudajaResponse.statusCode);
+          res.writeHead(502, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ error: 'Falha na comunicação com o provedor de pagamento', status: ajudajaResponse.statusCode }));
+          return;
+        }
+
         let ajudajaData;
         try {
           ajudajaData = JSON.parse(ajudajaResponse.body);
         } catch (e) {
-          console.error('Erro ao parsear JSON do ajudaja:', ajudajaResponse.body);
-          res.writeHead(500, { 'Content-Type': 'application/json' });
-          res.end(JSON.stringify({ error: 'Resposta inválida do ajudaja', raw: ajudajaResponse.body }));
+          console.error('Resposta do ajudaja não é um JSON válido:', ajudajaResponse.body);
+          res.writeHead(502, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ error: 'Resposta inválida do provedor', raw: ajudajaResponse.body.substring(0, 100) }));
           return;
         }
 
-        if (ajudajaData.status !== 'ok') {
-          console.warn('Ajudaja retornou erro:', ajudajaData);
+        if (ajudajaData.status !== 'ok' || !ajudajaData.url) {
+          console.warn('Ajudaja retornou erro ou URL ausente:', ajudajaData);
           res.writeHead(400, { 'Content-Type': 'application/json' });
-          res.end(JSON.stringify({ error: 'ajudaja retornou erro', data: ajudajaData }));
+          res.end(JSON.stringify({ error: 'O provedor recusou a geração do PIX', details: ajudajaData }));
           return;
         }
 
-        console.log('Passo 2: Buscando página do QR Code:', ajudajaData.url);
+        console.log('Passo 2: Buscando código PIX na página:', ajudajaData.url);
         const pixPageResponse = await makeRequest({
           hostname: 'ajudaja.com.br',
           path: `/ajudar/${ajudajaData.url}`,
@@ -116,35 +149,44 @@ const server = http.createServer(async (req, res) => {
         });
 
         const pixHtml = pixPageResponse.body;
-        const match = pixHtml.match(/id="qr_code_text_[^"]*"\s+name="[^"]*"\s+value="([^"]+)"/);
-        
-        if (!match) {
+        let pixCode = null;
+
+        // Tenta extrair usando Cheerio (mais robusto)
+        if (cheerio) {
+          const $ = cheerio.load(pixHtml);
+          pixCode = $('input[id^="qr_code_text_"]').val() || $('input[value^="0002"]').val();
+        }
+
+        // Fallback para Regex se Cheerio falhar ou não estiver disponível
+        if (!pixCode) {
+          const match1 = pixHtml.match(/id="qr_code_text_[^"]*".*?value="([^"]+)"/);
           const match2 = pixHtml.match(/value="(0002[^"]+)"/);
-          if (!match2) {
-            console.error('Não foi possível extrair o código PIX do HTML');
-            res.writeHead(500, { 'Content-Type': 'application/json' });
-            res.end(JSON.stringify({ error: 'Não foi possível extrair o código PIX' }));
-            return;
-          }
-          console.log('PIX extraído com sucesso (padrão 2)');
-          res.writeHead(200, { 'Content-Type': 'application/json' });
-          res.end(JSON.stringify({ success: true, pixCode: match2[1] }));
+          pixCode = (match1 ? match1[1] : null) || (match2 ? match2[1] : null);
+        }
+
+        if (!pixCode) {
+          console.error('Não foi possível localizar o código PIX no HTML retornado');
+          // Log do HTML para depuração (apenas os primeiros 500 caracteres)
+          console.log('Início do HTML recebido:', pixHtml.substring(0, 500));
+          res.writeHead(500, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ error: 'Erro ao extrair o código PIX da página de destino' }));
           return;
         }
 
-        console.log('PIX extraído com sucesso (padrão 1)');
+        console.log('PIX extraído com sucesso!');
         res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ success: true, pixCode: match[1] }));
+        res.end(JSON.stringify({ success: true, pixCode: pixCode }));
 
       } catch (err) {
-        console.error('Erro crítico no proxy:', err.message);
+        console.error('Erro crítico no processamento do proxy:', err.message);
         res.writeHead(500, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ error: err.message }));
+        res.end(JSON.stringify({ error: 'Erro interno no servidor proxy', message: err.message }));
       }
     });
     return;
   }
 
+  // Servir arquivos estáticos
   let filePath = path.join(__dirname, pathname === '/' ? 'index.html' : pathname);
   const ext = path.extname(filePath);
   const contentType = mimeTypes[ext] || 'text/plain';
@@ -152,10 +194,11 @@ const server = http.createServer(async (req, res) => {
   fs.readFile(filePath, (err, data) => {
     if (err) {
       if (err.code === 'ENOENT') {
+        // Fallback para index.html (útil para SPAs)
         fs.readFile(path.join(__dirname, 'index.html'), (err2, data2) => {
           if (err2) {
             res.writeHead(404);
-            res.end('Not found');
+            res.end('Arquivo não encontrado');
           } else {
             res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
             res.end(data2);
@@ -163,7 +206,7 @@ const server = http.createServer(async (req, res) => {
         });
       } else {
         res.writeHead(500);
-        res.end('Server error');
+        res.end('Erro interno ao ler arquivo');
       }
     } else {
       res.writeHead(200, { 'Content-Type': contentType });
@@ -173,5 +216,5 @@ const server = http.createServer(async (req, res) => {
 });
 
 server.listen(PORT, () => {
-  console.log(`Checkout server running on port ${PORT}`);
+  console.log(`Servidor de Checkout rodando na porta ${PORT}`);
 });
