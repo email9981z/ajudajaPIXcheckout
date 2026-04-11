@@ -1,0 +1,13 @@
+{
+  "name": "checkout-pix-ajudaja",
+  "version": "1.0.0",
+  "description": "Sistema de checkout com integração PIX via ajudaja.com.br",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {},
+  "engines": {
+    "node": ">=14.0.0"
+  }
+}
