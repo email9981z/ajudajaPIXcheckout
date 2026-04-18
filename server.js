@@ -5,8 +5,12 @@ const cheerio = require('cheerio');
 const cookieParser = require('cookie-parser');
 const path = require('path');
 
-// Carrega variáveis de ambiente
-require('dotenv').config();
+// Carrega variáveis de ambiente (opcional, não quebra se o arquivo .env não existir)
+try {
+  require('dotenv').config();
+} catch (e) {
+  console.log('Aviso: dotenv não carregado, usando variáveis de ambiente do sistema.');
+}
 
 const app = express();
 const PORT = process.env.PORT || 3000;
